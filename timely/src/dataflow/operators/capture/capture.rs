@@ -6,7 +6,7 @@
 //! queue, and a binary serializer wrapping any `W: Write`.
 
 use crate::Data;
-use crate::dataflow::{Scope, Stream};
+use crate::dataflow::{ProbeHandle, Scope, Stream};
 use crate::dataflow::channels::pact::Pipeline;
 use crate::dataflow::channels::pullers::Counter as PullCounter;
 use crate::dataflow::operators::generic::builder_raw::OperatorBuilder;
@@ -103,7 +103,11 @@ pub trait Capture<T: Timestamp, D: Data> {
     ///
     /// assert_eq!(recv0.extract()[0].1, (0..10).collect::<Vec<_>>());
     /// ```
-    fn capture_into<P: EventPusher<T, D>+'static>(&self, pusher: P);
+    fn capture_into<P: EventPusher<T, D>+'static>(&self, pusher: P) {
+        // WIP presumably don't want to maintain a probe that we're going to
+        // throw away for every `capture_into` and `capture` call.
+        self.capture_into_with_probe(pusher);
+    }
 
     /// Captures a stream using Rust's MPSC channels.
     fn capture(&self) -> ::std::sync::mpsc::Receiver<Event<T, D>> {
@@ -111,10 +115,16 @@ pub trait Capture<T: Timestamp, D: Data> {
         self.capture_into(send);
         recv
     }
+
+    /// The same as `capture_into` but it returns a probe that reflects the
+    /// capture progress.
+    fn capture_into_with_probe<P: EventPusher<T, D> + 'static>(&self, pusher: P) -> ProbeHandle<T>;
 }
 
 impl<S: Scope, D: Data> Capture<S::Timestamp, D> for Stream<S, D> {
-    fn capture_into<P: EventPusher<S::Timestamp, D>+'static>(&self, mut event_pusher: P) {
+    fn capture_into_with_probe<P: EventPusher<S::Timestamp, D>+'static>(&self, mut event_pusher: P) -> ProbeHandle<S::Timestamp> {
+        let probe = ProbeHandle::<S::Timestamp>::new();
+        let probe_frontier = probe.frontier();
 
         let mut builder = OperatorBuilder::new("Capture".to_owned(), self.scope());
         let mut input = PullCounter::new(builder.new_input(self, Pipeline));
@@ -129,9 +139,30 @@ impl<S: Scope, D: Data> Capture<S::Timestamp, D> for Stream<S, D> {
                     started = true;
                 }
                 if !progress.frontiers[0].is_empty() {
-                    // transmit any frontier progress.
+                    // surface all frontier changes to the probe.
+                    let mut borrow = probe_frontier.borrow_mut();
+                    // WIP can we use the return value of update_iter to construct
+                    // the Event::Progress message instead and save the clone?
+                    borrow.update_iter(progress.frontiers[0].iter().cloned());
+
+                    // transmit any frontier progress to the capture target.
                     let to_send = ::std::mem::replace(&mut progress.frontiers[0], ChangeBatch::new());
                     event_pusher.push(Event::Progress(to_send.into_inner()));
+
+                    // Okay this is a bit subtle. The probe's contract is that it's
+                    // only updated once events have been pushed to the capture
+                    // target. This means we shouldn't acknowledge the progress to
+                    // the probe until it's been `push`ed, but pushing takes
+                    // ownership and so we no longer have the info necessary to
+                    // update the probe.
+                    //
+                    // So, what we do is use the runtime exclusivity propery of
+                    // `Rc`'s borrow_mut to ensure that even though the probe has
+                    // been updated, no-one can read it until after push finishes.
+                    // Just to make sure rust doesn't get too clever and drop the
+                    // borrow before we're ready, we intentionally drop it here on
+                    // the other side of `push` from the `borrow_mut` call.
+                    drop(borrow);
                 }
 
                 use crate::communication::message::RefOrMut;
@@ -149,5 +180,6 @@ impl<S: Scope, D: Data> Capture<S::Timestamp, D> for Stream<S, D> {
                 false
             }
         );
-    }
+        probe
+      }
 }

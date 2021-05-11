@@ -151,6 +151,10 @@ impl<T: Timestamp> Handle<T> {
     /// Allocates a new handle.
     #[inline] pub fn new() -> Self { Handle { frontier: Rc::new(RefCell::new(MutableAntichain::new())) } }
 
+    pub(crate) fn frontier(&self) -> Rc<RefCell<MutableAntichain<T>>> {
+      self.frontier.clone()
+    }
+
     /// Invokes a method on the frontier, returning its result.
     ///
     /// This method allows inspection of the frontier, which cannot be returned by reference as
